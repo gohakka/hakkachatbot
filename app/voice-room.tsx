@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { events } from '../lib/sse.mjs';
 import { VoiceHealth } from '../lib/voice-health.mjs';
+import { playCallCue } from '../lib/call-cues.mjs';
 
 type Message = { id: string; role: 'user' | 'assistant'; text: string; partial?: boolean };
 type RoomType = import('livekit-client').Room;
@@ -48,6 +49,11 @@ export default function VoiceRoom() {
   const [callActive, setCallActive] = useState(false);
   const [callStartedAt, setCallStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
+  const [cueSpeaking, setCueSpeaking] = useState(false);
+  const [farewell, setFarewell] = useState(false);
+  const cueAudio = useRef<HTMLAudioElement>(null);
+  const cueStop = useRef<() => void>(() => {});
+  const helloPlayed = useRef(false);
   const room = useRef<RoomType | null>(null);
   const session = useRef<string | null>(null);
   const creating = useRef<Promise<string> | null>(null);
@@ -83,7 +89,8 @@ export default function VoiceRoom() {
   },[callActive,callStartedAt]);
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; voiceWanted.current=false; generation.current++; if(voiceTimer.current) clearTimeout(voiceTimer.current); controllers.current.forEach(c => c.abort()); room.current?.disconnect(); meterCleanup.current(); context.current?.close(); };
+    void playCue('hello');
+    return () => { mounted.current = false; cueStop.current();voiceWanted.current=false; generation.current++; if(voiceTimer.current) clearTimeout(voiceTimer.current); controllers.current.forEach(c => c.abort()); room.current?.disconnect(); meterCleanup.current(); context.current?.close(); };
   }, []);
   useEffect(() => {
     const timer=setInterval(async()=>{
@@ -215,10 +222,25 @@ export default function VoiceRoom() {
     await Promise.all(Array.from(elements,el=>{el.muted=mutedRef.current;return el.play();}));
     blocked(!r.canPlaybackAudio);
   }
+  async function playCue(kind: 'hello' | 'goodbye') {
+    cueStop.current();
+    const element=cueAudio.current;
+    if(!element)return;
+    element.muted=mutedRef.current;
+    const cue=playCallCue(element,`/audio/hani-${kind}.wav`,()=>{
+      if(kind==='hello')helloPlayed.current=true;
+      if(mounted.current)setCueSpeaking(true);
+    });
+    cueStop.current=cue.stop;
+    await cue.done;
+    if(mounted.current)setCueSpeaking(false);
+  }
   async function toggleMic(repair = false) {
     if (changing.current) return;
     changing.current=true; setError('');
     const wanted=repair?voiceWanted.current:true;
+    const hello=(!repair&&!room.current&&!helloPlayed.current)?playCue('hello'):Promise.resolve();
+    if(!repair)setFarewell(false);
     try {
       // Run before waiting for imports/network, while the user gesture is active.
       context.current ??= new AudioContext(); await context.current.resume();
@@ -267,6 +289,8 @@ export default function VoiceRoom() {
       });
       await r.connect(d.url,d.token);if(!current()){await r.disconnect();return;}
       await resumePlayback().catch(()=>blocked(true));
+      await hello;
+      if(!current()){await r.disconnect();return;}
       await r.localParticipant.setMicrophoneEnabled(wanted);
       voiceWanted.current=wanted;
       const track=r.localParticipant.getTrackPublication(sdk.Track.Source.Microphone)?.track?.mediaStreamTrack;
@@ -288,7 +312,8 @@ export default function VoiceRoom() {
     const old=room.current;room.current=null;
     try {await old?.disconnect();} finally {
       meterCleanup.current();audio.current?.replaceChildren();remoteTracks.current.clear();remoteEnergy.current.clear();
-      setCallActive(false);setCallStartedAt(null);setMode('idle');setSpeaking(false);setMicActive(false);setCanRepair(false);blocked(false);setError('');setVoiceNotice('通話已結束，想聊的時候，再打給哈妮。');changing.current=false;
+      setCallActive(false);setCallStartedAt(null);setMode('idle');setSpeaking(false);setMicActive(false);setCanRepair(false);blocked(false);setError('');setVoiceNotice('');setFarewell(true);helloPlayed.current=false;
+      try { await playCue('goodbye'); } finally {changing.current=false;}
     }
   }
   async function newConversation() {
@@ -296,28 +321,28 @@ export default function VoiceRoom() {
     changing.current=true;generation.current++;if(voiceTimer.current)clearTimeout(voiceTimer.current);
     controllers.current.forEach(c=>c.abort());activeTurns.current.clear();following.current.clear();
     const old=room.current;room.current=null;await old?.disconnect();meterCleanup.current();audio.current?.replaceChildren();
-    session.current=null;voiceWanted.current=false;health.current.reset();remoteTracks.current.clear();remoteEnergy.current.clear();setCallActive(false);setCallStartedAt(null);setElapsed(0);setCanRepair(false);setVoiceNotice('');setMessages([]);setError('');setMode('idle');setBusy(false);setSpeaking(false);setMicActive(false);blocked(false);changing.current=false;
+    session.current=null;cueStop.current();setFarewell(false);helloPlayed.current=false;voiceWanted.current=false;health.current.reset();remoteTracks.current.clear();remoteEnergy.current.clear();setCallActive(false);setCallStartedAt(null);setElapsed(0);setCanRepair(false);setVoiceNotice('');setMessages([]);setError('');setMode('idle');setBusy(false);setSpeaking(false);setMicActive(false);blocked(false);changing.current=false;
   }
-  function toggleSound(){const next=!muted;setMuted(next);mutedRef.current=next;audio.current?.querySelectorAll('audio').forEach(el=>{el.muted=next;});}
+  function toggleSound(){const next=!muted;setMuted(next);mutedRef.current=next;if(cueAudio.current)cueAudio.current.muted=next;audio.current?.querySelectorAll('audio').forEach(el=>{el.muted=next;});}
   async function unlockAudio(){await resumePlayback();}
   const connecting=mode==='connecting'||mode==='reconnecting';
-  const status=mode==='connecting'?'正在撥給哈妮…':mode==='reconnecting'?'正在恢復通話…':callActive?(speaking?'哈妮正在說話':mode==='idle'?'麥克風已暫停':micActive?'哈妮在聽你說':'通話中，慢慢說就好'):'你的客語聊天夥伴';
+  const status=cueSpeaking?(farewell?'承蒙你，正來尞':'你好，食飽吂？'):mode==='connecting'?'正在撥給哈妮…':mode==='reconnecting'?'正在恢復通話…':callActive?(speaking?'哈妮正在說話':mode==='idle'?'麥克風已暫停':micActive?'哈妮在聽你說':'通話中，慢慢說就好'):farewell?'承蒙你，正來尞':'你好，食飽吂？';
   const duration=`${String(Math.floor(elapsed/60)).padStart(2,'0')}:${String(elapsed%60).padStart(2,'0')}`;
   return <div className="app">
     <header className="topbar"><a className="wordmark" href="/" aria-label="國立聯合大學客家研究學院客家AI生態系首頁">國立聯合大學客家研究學院客家AI生態系</a><span className="header-note">一通電話，用客語聊聊。</span><span className="language"><span/>客語</span></header>
     <main className={`call-layout ${showSubtitles?'with-subtitles':''}`}>
       <section className="call-area" aria-label="與哈妮通話">
-        <div className="call-intro"><span className="eyebrow">A FAMILIAR VOICE, A LITTLE CLOSER.</span><h1>想講的話，打給哈妮。</h1></div>
+        <div className="call-intro"><h1>想講的話，打給哈妮。</h1></div>
         <div className={`contact-card ${callActive?'in-call':''}`}>
           <div className="contact-heading"><div><h2>哈妮</h2><span>Hani</span></div><span className={`availability ${callActive?'live':''}`}>{callActive?<><span/>{duration}</>:<>客語夥伴</>}</span></div>
-          <div ref={orb} className={`orb-stage ${micActive||speaking?'is-active':''} ${connecting?'is-connecting':''}`}>
+          <div ref={orb} className={`orb-stage ${micActive||speaking||cueSpeaking?'is-active':''} ${connecting?'is-connecting':''}`}>
             <span className="orbit"/><span className="orbit"/><span className="ripple"/><span className="ripple delay"/>
-            <div className="hani-avatar" aria-hidden="true"><svg viewBox="0 0 200 200" fill="none"><path d="M100 37c28-38 72-6 53 27 46-2 54 51 14 63 33 31-1 73-35 50-8 44-61 44-69 0-35 23-68-19-35-50-40-12-32-65 14-63-19-33 25-65 58-27Z" fill="currentColor"/><path d="M75 93v6m50-6v6m-39 21c7 6 21 6 28 0" stroke="#f6f7ee" strokeWidth="5" strokeLinecap="round"/></svg></div>
+            <div className="hani-avatar" aria-hidden="true"/>
           </div>
           <div className="contact-status" role="status">{status}</div><div ref={bars} className="wave-bars" aria-hidden="true">{Array.from({length:17},(_,i)=><i key={i}/>)}</div>
           <p className="card-caption">{callActive?'不用趕，哈妮一直都在聽。':'說說今天，或只是打聲招呼。'}</p>
         </div>
-        {!callActive?<button className="call-button" disabled={connecting} onClick={()=>toggleMic()}><Icon name="phone"/>{connecting?'正在連線…':'開始通話'}</button>:<div className="call-controls"><button className={`control-button ${mode==='idle'?'selected':''}`} onClick={()=>toggleMic()} disabled={connecting} aria-pressed={mode==='idle'} aria-label={mode==='idle'?'開啟麥克風':'暫停麥克風'}><Icon name={mode==='idle'?'mute':'mic'}/><span>{mode==='idle'?'開啟麥克風':'麥克風'}</span></button><button className="hangup-button" onClick={endCall} disabled={connecting} aria-label="結束通話"><Icon name="hangup"/></button><button className={`control-button ${muted?'selected':''}`} onClick={toggleSound} aria-pressed={muted} aria-label={muted?'開啟哈妮的聲音':'靜音哈妮的聲音'}><Icon name={muted?'quiet':'sound'}/><span>{muted?'開啟聲音':'聲音'}</span></button></div>}
+        {!callActive?<button className="call-button" disabled={connecting||cueSpeaking} onClick={()=>toggleMic()}><Icon name="phone"/>{connecting?'正在連線…':cueSpeaking&&farewell?'道別中…':'開始通話'}</button>:<div className="call-controls"><button className={`control-button ${mode==='idle'?'selected':''}`} onClick={()=>toggleMic()} disabled={connecting} aria-pressed={mode==='idle'} aria-label={mode==='idle'?'開啟麥克風':'暫停麥克風'}><Icon name={mode==='idle'?'mute':'mic'}/><span>{mode==='idle'?'開啟麥克風':'麥克風'}</span></button><button className="hangup-button" onClick={endCall} disabled={connecting} aria-label="結束通話"><Icon name="hangup"/></button><button className={`control-button ${muted?'selected':''}`} onClick={toggleSound} aria-pressed={muted} aria-label={muted?'開啟哈妮的聲音':'靜音哈妮的聲音'}><Icon name={muted?'quiet':'sound'}/><span>{muted?'開啟聲音':'聲音'}</span></button></div>}
         <button className={`subtitle-toggle ${showSubtitles?'enabled':''}`} role="switch" aria-checked={showSubtitles} aria-controls="conversation-subtitles" onClick={()=>setShowSubtitles(v=>!v)}><Icon name="chat"/><span>{showSubtitles?'關閉對話字幕':'開啟對話字幕'}</span><span className="switch-track"><span/></span></button>
         {canRepair&&<button className="repair-voice" disabled={connecting} onClick={()=>toggleMic(true)}>恢復語音</button>}
         <div className="call-notices">{voiceNotice&&<p className="voice-notice" role="status">{voiceNotice}</p>}{error&&<p className="error" role="alert">{error}</p>}{audioBlocked&&<button className="audio-unlock" onClick={()=>unlockAudio().catch(()=>setError('請檢查瀏覽器的聲音播放權限。'))}>點一下，開啟哈妮的聲音</button>}</div>
@@ -325,10 +350,10 @@ export default function VoiceRoom() {
       <section id="conversation-subtitles" className="chat-panel" hidden={!showSubtitles} aria-label="對話字幕">
         <header className="chat-header"><div className="chat-title">對話字幕<span>與哈妮</span></div><div className="chat-tools"><button className="icon-btn" disabled={sending||busy||connecting} onClick={newConversation} aria-label="開始新對話"><Icon name="plus"/></button><button className="icon-btn" onClick={()=>setShowSubtitles(false)} aria-label="關閉對話字幕"><Icon name="close"/></button></div></header>
         <div className="chat-scroll" ref={scroll} role="log" aria-label="對話紀錄" aria-live={showSubtitles?'polite':'off'} aria-relevant="additions text">
-          {messages.length===0?<div className="empty-subtitles"><Icon name="chat"/><h3>每句話，都在這裡。</h3><p>開始通話後，你和哈妮說的話<br/>會即時顯示在這裡。</p><div className="suggestions">{prompts.map(p=><button key={p} disabled={sending} onClick={()=>send(p)}>{p}</button>)}</div></div>:messages.map(m=><article key={m.id} className={`message ${m.role} ${m.partial?'partial':''}`}><div className="message-label">{m.role==='user'?'你':'哈妮'}{m.partial&&<span>・{m.role==='user'?'辨識中':'回覆中'}</span>}</div><div className="bubble">{m.text}</div></article>)}
+          {messages.length===0?<div className="empty-subtitles"><Icon name="chat"/><h3>你好，食飽吂？</h3><p>開始通話後，字幕會即時顯示在這裡。</p><div className="suggestions">{prompts.map(p=><button key={p} disabled={sending} onClick={()=>send(p)}>{p}</button>)}</div></div>:messages.map(m=><article key={m.id} className={`message ${m.role} ${m.partial?'partial':''}`}><div className="message-label">{m.role==='user'?'你':'哈妮'}{m.partial&&<span>・{m.role==='user'?'辨識中':'回覆中'}</span>}</div><div className="bubble">{m.text}</div></article>)}
           {busy&&<div className="thinking" role="status" aria-label="哈妮正在回覆"><i/><i/><i/></div>}
         </div><div className="chat-bottom"><form className="inputbox" onSubmit={e=>{e.preventDefault();void send(text);}}><label htmlFor="message" className="sr-only">輸入文字訊息</label><input id="message" value={text} onChange={e=>setText(e.target.value)} maxLength={7900} placeholder="也可以打字給哈妮…" disabled={sending}/><button type="submit" aria-label="傳送訊息" disabled={!text.trim()||sending}><Icon name="send"/></button></form><p className="input-meta">語音與文字，共用同一段對話。</p></div>
       </section>
-    </main><footer className="page-footer"><span>隨時，來講兩句。</span><small>語音及訊息由 Morari 處理 · AI 回覆可能有誤</small></footer><div ref={audio} className="replay-audio"/>
+    </main><footer className="page-footer"><span>隨時，來講兩句。</span><small>語音及訊息由 Morari 處理 · AI 回覆可能有誤</small></footer><div ref={audio} className="replay-audio"/><audio ref={cueAudio} preload="auto" src="/audio/hani-hello.wav" className="replay-audio"/>
   </div>;
 }
