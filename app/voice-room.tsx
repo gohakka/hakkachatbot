@@ -326,7 +326,7 @@ export default function VoiceRoom() {
   function toggleSound(){const next=!muted;setMuted(next);mutedRef.current=next;if(cueAudio.current)cueAudio.current.muted=next;audio.current?.querySelectorAll('audio').forEach(el=>{el.muted=next;});}
   async function unlockAudio(){await resumePlayback();}
   const connecting=mode==='connecting'||mode==='reconnecting';
-  const status=cueSpeaking?(farewell?'承蒙你，正來尞':'你好，食飽吂？'):mode==='connecting'?'正在撥給哈妮…':mode==='reconnecting'?'正在恢復通話…':callActive?(speaking?'哈妮正在說話':mode==='idle'?'麥克風已暫停':micActive?'哈妮在聽你說':'通話中，慢慢說就好'):farewell?'承蒙你，正來尞':'你好，食飽吂？';
+  const status=cueSpeaking?(farewell?'承蒙你，正來尞':'你好，食飽吂？'):mode==='connecting'?'正在撥給哈妮…':mode==='reconnecting'?'正在恢復通話…':callActive?'':farewell?'承蒙你，正來尞':'你好，食飽吂？';
   const duration=`${String(Math.floor(elapsed/60)).padStart(2,'0')}:${String(elapsed%60).padStart(2,'0')}`;
   return <div className="app">
     <header className="topbar"><a className="wordmark" href="/" aria-label="國立聯合大學客家研究學院客家AI生態系首頁">國立聯合大學客家研究學院客家AI生態系</a><span className="header-note">一通電話，用客語聊聊。</span><span className="language"><span/>客語</span></header>
@@ -340,7 +340,7 @@ export default function VoiceRoom() {
             <div className="hani-avatar" aria-hidden="true"/>
           </div>
           <div className="contact-status" role="status">{status}</div><div ref={bars} className="wave-bars" aria-hidden="true">{Array.from({length:17},(_,i)=><i key={i}/>)}</div>
-          <p className="card-caption">{callActive?'不用趕，哈妮一直都在聽。':'說說今天，或只是打聲招呼。'}</p>
+          {!callActive&&<p className="card-caption">說說今天，或只是打聲招呼。</p>}
         </div>
         {!callActive?<button className="call-button" disabled={connecting||cueSpeaking} onClick={()=>toggleMic()}><Icon name="phone"/>{connecting?'正在連線…':cueSpeaking&&farewell?'道別中…':'開始通話'}</button>:<div className="call-controls"><button className={`control-button ${mode==='idle'?'selected':''}`} onClick={()=>toggleMic()} disabled={connecting} aria-pressed={mode==='idle'} aria-label={mode==='idle'?'開啟麥克風':'暫停麥克風'}><Icon name={mode==='idle'?'mute':'mic'}/><span>{mode==='idle'?'開啟麥克風':'麥克風'}</span></button><button className="hangup-button" onClick={endCall} disabled={connecting} aria-label="結束通話"><Icon name="hangup"/></button><button className={`control-button ${muted?'selected':''}`} onClick={toggleSound} aria-pressed={muted} aria-label={muted?'開啟哈妮的聲音':'靜音哈妮的聲音'}><Icon name={muted?'quiet':'sound'}/><span>{muted?'開啟聲音':'聲音'}</span></button></div>}
         <button className={`subtitle-toggle ${showSubtitles?'enabled':''}`} role="switch" aria-checked={showSubtitles} aria-controls="conversation-subtitles" onClick={()=>setShowSubtitles(v=>!v)}><Icon name="chat"/><span>{showSubtitles?'關閉對話字幕':'開啟對話字幕'}</span><span className="switch-track"><span/></span></button>
