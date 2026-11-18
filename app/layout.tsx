@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "共下講 · 客語語音夥伴",
-  description: "用客語，講你想講的。大顆麥克風、即時對話字幕，陪你聊聊日常。",
+  title: "哈妮 Hani · 打一通客語電話",
+  description: "想講的話，打給哈妮。你的客語聊天夥伴，支援即時對話字幕。",
   icons: {
     icon: "/favicon.svg",
     shortcut: "/favicon.svg",

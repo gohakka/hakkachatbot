@@ -17,6 +17,9 @@ function Icon({ name, ...props }: { name: string; className?: string }) {
     mute: <><path d="m3 3 18 18M8 8v3a4 4 0 0 0 6.8 2.8M16 9V6a4 4 0 0 0-7-2.6M5 10v2a7 7 0 0 0 12 4.9M19 10v2M12 19v3m-4 0h8"/></>,
     chat: <path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5Z"/>,
     plus: <path d="M12 5v14M5 12h14"/>,
+    phone: <path d="M7.2 3H4.8C3.8 3 3 3.8 3 4.8A16.2 16.2 0 0 0 19.2 21c1 0 1.8-.8 1.8-1.8v-2.4c0-.8-.5-1.5-1.3-1.7l-2.7-.8c-.6-.2-1.3 0-1.7.4l-1.2 1.2a13 13 0 0 1-6-6l1.2-1.2c.4-.4.6-1.1.4-1.7l-.8-2.7C8.7 3.5 8 3 7.2 3Z"/>,
+    hangup: <path d="M3 15v-3c0-.5.2-1 .7-1.3a16 16 0 0 1 16.6 0c.5.3.7.8.7 1.3v3c0 .6-.5 1-1 1h-3c-.6 0-1-.4-1-1v-2a13 13 0 0 0-8 0v2c0 .6-.4 1-1 1H4c-.6 0-1-.4-1-1Z"/>,
+    close: <path d="m6 6 12 12M18 6 6 18"/>,
     send: <><path d="m21 3-7 18-4-7-7-4 18-7ZM10 14 21 3"/></>,
     sound: <><path d="m11 5-6 4H2v6h3l6 4V5ZM15 8a6 6 0 0 1 0 8M18 5a10 10 0 0 1 0 14"/></>,
     quiet: <><path d="m11 5-6 4H2v6h3l6 4V5ZM17 9l5 6m0-6-5 6"/></>,
@@ -41,6 +44,10 @@ export default function VoiceRoom() {
   const [micActive, setMicActive] = useState(false);
   const [voiceNotice, setVoiceNotice] = useState('');
   const [canRepair, setCanRepair] = useState(false);
+  const [showSubtitles, setShowSubtitles] = useState(false);
+  const [callActive, setCallActive] = useState(false);
+  const [callStartedAt, setCallStartedAt] = useState<number | null>(null);
+  const [elapsed, setElapsed] = useState(0);
   const room = useRef<RoomType | null>(null);
   const session = useRef<string | null>(null);
   const creating = useRef<Promise<string> | null>(null);
@@ -69,6 +76,11 @@ export default function VoiceRoom() {
   const activeTurns = useRef(new Set<string>());
   const voiceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mounted = useRef(true);
+  useEffect(()=>{
+    if(!callActive || callStartedAt===null)return;
+    const update=()=>setElapsed(Math.floor((Date.now()-callStartedAt)/1000));update();
+    const timer=setInterval(update,1000);return ()=>clearInterval(timer);
+  },[callActive,callStartedAt]);
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; voiceWanted.current=false; generation.current++; if(voiceTimer.current) clearTimeout(voiceTimer.current); controllers.current.forEach(c => c.abort()); room.current?.disconnect(); meterCleanup.current(); context.current?.close(); };
@@ -98,7 +110,7 @@ export default function VoiceRoom() {
     },2000);
     return ()=>clearInterval(timer);
   },[]);
-  useEffect(() => { if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [messages, busy]);
+  useEffect(() => { if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [messages, busy, showSubtitles]);
   function upsert(message: Message) {
     setMessages(old => { const i = old.findIndex(m => m.id === message.id); return i < 0 ? [...old, message] : old.map((m, j) => j === i ? message : m); });
   }
@@ -245,7 +257,7 @@ export default function VoiceRoom() {
       r.on(sdk.RoomEvent.ParticipantDisconnected,p=>{if(!current()||!p.isAgent||!voiceWanted.current)return;setVoiceNotice('助理語音已離線，正在重新連線…');if(voiceTimer.current)clearTimeout(voiceTimer.current);voiceTimer.current=setTimeout(()=>{if(current()&&voiceWanted.current)restoreVoice.current();},1500);});
       r.on(sdk.RoomEvent.Reconnecting,()=>{if(current())setMode('reconnecting');});
       r.on(sdk.RoomEvent.Reconnected,()=>{if(current()){setMode(r.localParticipant.isMicrophoneEnabled?'listening':'idle');void resumePlayback().catch(()=>blocked(true));}});
-      r.on(sdk.RoomEvent.Disconnected,()=>{if(!current())return;agentReady();room.current=null;setMode('idle');setSpeaking(false);setMicActive(false);meterCleanup.current();audio.current?.replaceChildren();setVoiceNotice('語音連線已結束，可按「恢復語音」重新連線。');});
+      r.on(sdk.RoomEvent.Disconnected,()=>{if(!current())return;agentReady();room.current=null;setCallActive(false);setMode('idle');setSpeaking(false);setMicActive(false);meterCleanup.current();audio.current?.replaceChildren();setVoiceNotice('通話連線已結束，可按「恢復語音」重新連線。');});
       r.registerTextStreamHandler('morari.voice.events',async reader=>{
         const raw=await reader.readAll();if(!current())return;
         try {const e=JSON.parse(raw);if(e.session_id!==sid)return;
@@ -261,32 +273,62 @@ export default function VoiceRoom() {
       startMeter();
       if(track)attachMeter(track);
       r.remoteParticipants.forEach(p=>p.audioTrackPublications.forEach(pub=>{if(pub.track)attachMeter(pub.track.mediaStreamTrack);}));
-      setMode(wanted?'listening':'idle');setCanRepair(true);setVoiceNotice(repair?'語音已重新連線，請再說一句話試試。':'');
+      setMode(wanted?'listening':'idle');setCanRepair(true);setCallActive(true);if(!repair){setCallStartedAt(Date.now());setElapsed(0);}setVoiceNotice(repair?'語音已重新連線，請再說一句話試試。':'');
       if(![...r.remoteParticipants.values()].some(p=>p.isAgent))voiceTimer.current=setTimeout(()=>{if(current())setError('助理仍在準備中；若持續沒有回應，請暫停後重新開啟麥克風。');},20000);
     } catch(e) {
-      const r=room.current;room.current=null;await r?.disconnect();meterCleanup.current();audio.current?.replaceChildren();setMode('idle');setSpeaking(false);
+      const r=room.current;room.current=null;await r?.disconnect();meterCleanup.current();audio.current?.replaceChildren();setMode('idle');setCallActive(false);setSpeaking(false);setVoiceNotice('');
       setError(e instanceof Error && e.name==='NotAllowedError'?'麥克風權限尚未開啟，請在瀏覽器允許麥克風後重試。':e instanceof Error?e.message:'語音連線失敗，請再試一次。');
     } finally {changing.current=false;}
   }
   restoreVoice.current=()=>{if(!changing.current&&health.current.canAttempt(Date.now()))void toggleMic(true);};
+  async function endCall() {
+    if(changing.current)return;
+    changing.current=true;voiceWanted.current=false;health.current.reset();
+    if(voiceTimer.current)clearTimeout(voiceTimer.current);
+    const old=room.current;room.current=null;
+    try {await old?.disconnect();} finally {
+      meterCleanup.current();audio.current?.replaceChildren();remoteTracks.current.clear();remoteEnergy.current.clear();
+      setCallActive(false);setCallStartedAt(null);setMode('idle');setSpeaking(false);setMicActive(false);setCanRepair(false);blocked(false);setError('');setVoiceNotice('通話已結束，想聊的時候，再打給哈妮。');changing.current=false;
+    }
+  }
   async function newConversation() {
     if(changing.current||sending||busy)return;
     changing.current=true;generation.current++;if(voiceTimer.current)clearTimeout(voiceTimer.current);
     controllers.current.forEach(c=>c.abort());activeTurns.current.clear();following.current.clear();
     const old=room.current;room.current=null;await old?.disconnect();meterCleanup.current();audio.current?.replaceChildren();
-    session.current=null;voiceWanted.current=false;health.current.reset();remoteTracks.current.clear();remoteEnergy.current.clear();setCanRepair(false);setVoiceNotice('');setMessages([]);setError('');setMode('idle');setBusy(false);setSpeaking(false);setMicActive(false);blocked(false);changing.current=false;
+    session.current=null;voiceWanted.current=false;health.current.reset();remoteTracks.current.clear();remoteEnergy.current.clear();setCallActive(false);setCallStartedAt(null);setElapsed(0);setCanRepair(false);setVoiceNotice('');setMessages([]);setError('');setMode('idle');setBusy(false);setSpeaking(false);setMicActive(false);blocked(false);changing.current=false;
   }
   function toggleSound(){const next=!muted;setMuted(next);mutedRef.current=next;audio.current?.querySelectorAll('audio').forEach(el=>{el.muted=next;});}
   async function unlockAudio(){await resumePlayback();}
-  const status=mode==='connecting'?'正在連接客語助理…':mode==='reconnecting'?'正在重新連線…':speaking?'助理說話中':mode==='listening'?(micActive?'聽著你講…':'麥克風已開啟，請開始說話'):busy?'助理正在思考…':'準備好了，來聊聊天';
+  const connecting=mode==='connecting'||mode==='reconnecting';
+  const status=mode==='connecting'?'正在撥給哈妮…':mode==='reconnecting'?'正在恢復通話…':callActive?(speaking?'哈妮正在說話':mode==='idle'?'麥克風已暫停':micActive?'哈妮在聽你說':'通話中，慢慢說就好'):'你的客語聊天夥伴';
+  const duration=`${String(Math.floor(elapsed/60)).padStart(2,'0')}:${String(elapsed%60).padStart(2,'0')}`;
   return <div className="app">
-    <header className="topbar"><a className="brand" href="/" aria-label="客語共下講首頁"><span className="brandmark">客</span><div><div className="brandname">共下講</div><small>HAKKA VOICE COMPANION</small></div></a><div className="navmeta"><span className="language">客語對話</span><span>讓熟悉的語言，陪你聊聊日常</span></div></header>
-    <main className="layout"><section className="voice-side" aria-label="語音對話控制"><div className="eyebrow">A LITTLE CONVERSATION, IN HAKKA</div><h1>用客語，<br/><span>講你想講的。</span></h1><p className="intro">一聲問候、一段日常，都可以從這裡開始。<br/>按下麥克風，讓我們陪你慢慢聊。</p>
-      <div ref={orb} className={`orb-stage ${micActive||speaking?'is-active':''}`} aria-hidden={false}><span className="orbit"/><span className="orbit"/><span className="orbit"/><span className="orb-glow"/><span className="ripple"/><span className="ripple delay"/><span className="orbit-dot"/><button className={`mic ${mode==='listening'?'on':''}`} onClick={()=>toggleMic()} disabled={mode==='connecting'||mode==='reconnecting'} aria-pressed={mode==='listening'} aria-label={mode==='listening'?'暫停麥克風':'開啟麥克風，開始客語對話'}><Icon name={mode==='listening'?'mute':'mic'}/><span>{mode==='connecting'?'連線中':mode==='listening'?'點一下暫停':'點一下開始'}</span></button></div>
-      <div className="voice-status" role="status"><span className={`status-light ${mode==='listening'||speaking?'active':''}`}/>{status}</div><div ref={bars} className="wave-bars" aria-hidden="true">{Array.from({length:23},(_,i)=><i key={i}/>)}</div>{canRepair&&<button className="repair-voice" disabled={mode==='connecting'||mode==='reconnecting'} onClick={()=>toggleMic(true)}>恢復語音</button>}<p className="hint">{mode==='listening'?'說完稍停，助理就會回應你':'開啟後可持續對話，再按一次即可暫停'}</p><div className="voice-footer"><span><Icon name="mic"/>預設客語</span><span><Icon name="chat"/>即時對話字幕</span><span><Icon name="shield"/>由 Morari 助理提供服務</span></div>
-    </section><section className="chat-panel" aria-label="對話字幕"><header className="chat-header"><div className="chat-title"><Icon name="chat"/>對話字幕<small>即時</small></div><div style={{display:'flex',gap:8}}><button className="icon-btn" onClick={toggleSound} aria-label={muted?'開啟助理聲音':'靜音助理聲音'} aria-pressed={muted}><Icon name={muted?'quiet':'sound'}/></button><button className="icon-btn" disabled={sending||busy||mode==='connecting'||mode==='reconnecting'} onClick={newConversation}><Icon name="plus"/>新對話</button></div></header>
-      <div className="chat-scroll" ref={scroll} role="log" aria-label="對話紀錄" aria-live="polite" aria-relevant="additions text"><div className="date-rule">從一句問候開始</div>{messages.length===0?<div className="message"><div className="message-label"><span className="mini-avatar">客</span>客語助理</div><div className="bubble"><div className="welcome-emblem" aria-hidden="true">✳</div><p className="welcome-title">你好，歡迎來到共下講。</p><p className="welcome-copy">想練習客語，還是找個伴聊聊？<br/>按下左邊的麥克風，說說今天的心情。<br/>你說的話和助理的回覆，都會出現在這裡。</p></div><div className="suggestions">{prompts.map(p=><button key={p} disabled={sending} onClick={()=>send(p)}>{p}</button>)}</div></div>:messages.map(m=><article key={m.id} className={`message ${m.role} ${m.partial?'partial':''}`}><div className="message-label">{m.role==='assistant'&&<span className="mini-avatar">客</span>}{m.role==='user'?'你':'客語助理'}{m.partial&&<span>・{m.role==='user'?'辨識中':'回覆中'}</span>}</div><div className="bubble">{m.text}</div></article>)}{busy&&<div className="thinking" role="status" aria-label="助理正在回覆"><i/><i/><i/></div>}</div>
-      {voiceNotice&&<div className="voice-notice" role="status">{voiceNotice}</div>}{error&&<div className="error" role="alert">{error}</div>}{audioBlocked&&<button className="audio-unlock" onClick={()=>unlockAudio().catch(()=>setError('請檢查瀏覽器的聲音播放權限。'))}>點一下，開啟助理聲音</button>}<div className="chat-bottom"><form className="inputbox" onSubmit={e=>{e.preventDefault();void send(text);}}><label htmlFor="message" className="sr-only">輸入文字訊息</label><input id="message" value={text} onChange={e=>setText(e.target.value)} maxLength={7900} placeholder="也可以打字，和助理聊聊…" disabled={sending}/><button type="submit" aria-label="傳送訊息" disabled={!text.trim()||sending}><Icon name="send"/></button></form><p className="input-meta">語音與文字皆連接同一段對話 · 預設客語回覆</p></div>
-    </section></main><p className="bottom-note">語音及訊息由 Morari 平台處理 · AI 回覆可能有誤，請依實際情況確認</p><div ref={audio} className="replay-audio"/>
+    <header className="topbar"><a className="wordmark" href="/" aria-label="國立聯合大學客家研究學院客家AI生態系首頁">國立聯合大學客家研究學院客家AI生態系</a><span className="header-note">一通電話，用客語聊聊。</span><span className="language"><span/>客語</span></header>
+    <main className={`call-layout ${showSubtitles?'with-subtitles':''}`}>
+      <section className="call-area" aria-label="與哈妮通話">
+        <div className="call-intro"><span className="eyebrow">A FAMILIAR VOICE, A LITTLE CLOSER.</span><h1>想講的話，打給哈妮。</h1></div>
+        <div className={`contact-card ${callActive?'in-call':''}`}>
+          <div className="contact-heading"><div><h2>哈妮</h2><span>Hani</span></div><span className={`availability ${callActive?'live':''}`}>{callActive?<><span/>{duration}</>:<>客語夥伴</>}</span></div>
+          <div ref={orb} className={`orb-stage ${micActive||speaking?'is-active':''} ${connecting?'is-connecting':''}`}>
+            <span className="orbit"/><span className="orbit"/><span className="ripple"/><span className="ripple delay"/>
+            <div className="hani-avatar" aria-hidden="true"><svg viewBox="0 0 200 200" fill="none"><path d="M100 37c28-38 72-6 53 27 46-2 54 51 14 63 33 31-1 73-35 50-8 44-61 44-69 0-35 23-68-19-35-50-40-12-32-65 14-63-19-33 25-65 58-27Z" fill="currentColor"/><path d="M75 93v6m50-6v6m-39 21c7 6 21 6 28 0" stroke="#f6f7ee" strokeWidth="5" strokeLinecap="round"/></svg></div>
+          </div>
+          <div className="contact-status" role="status">{status}</div><div ref={bars} className="wave-bars" aria-hidden="true">{Array.from({length:17},(_,i)=><i key={i}/>)}</div>
+          <p className="card-caption">{callActive?'不用趕，哈妮一直都在聽。':'說說今天，或只是打聲招呼。'}</p>
+        </div>
+        {!callActive?<button className="call-button" disabled={connecting} onClick={()=>toggleMic()}><Icon name="phone"/>{connecting?'正在連線…':'開始通話'}</button>:<div className="call-controls"><button className={`control-button ${mode==='idle'?'selected':''}`} onClick={()=>toggleMic()} disabled={connecting} aria-pressed={mode==='idle'} aria-label={mode==='idle'?'開啟麥克風':'暫停麥克風'}><Icon name={mode==='idle'?'mute':'mic'}/><span>{mode==='idle'?'開啟麥克風':'麥克風'}</span></button><button className="hangup-button" onClick={endCall} disabled={connecting} aria-label="結束通話"><Icon name="hangup"/></button><button className={`control-button ${muted?'selected':''}`} onClick={toggleSound} aria-pressed={muted} aria-label={muted?'開啟哈妮的聲音':'靜音哈妮的聲音'}><Icon name={muted?'quiet':'sound'}/><span>{muted?'開啟聲音':'聲音'}</span></button></div>}
+        <button className={`subtitle-toggle ${showSubtitles?'enabled':''}`} role="switch" aria-checked={showSubtitles} aria-controls="conversation-subtitles" onClick={()=>setShowSubtitles(v=>!v)}><Icon name="chat"/><span>{showSubtitles?'關閉對話字幕':'開啟對話字幕'}</span><span className="switch-track"><span/></span></button>
+        {canRepair&&<button className="repair-voice" disabled={connecting} onClick={()=>toggleMic(true)}>恢復語音</button>}
+        <div className="call-notices">{voiceNotice&&<p className="voice-notice" role="status">{voiceNotice}</p>}{error&&<p className="error" role="alert">{error}</p>}{audioBlocked&&<button className="audio-unlock" onClick={()=>unlockAudio().catch(()=>setError('請檢查瀏覽器的聲音播放權限。'))}>點一下，開啟哈妮的聲音</button>}</div>
+      </section>
+      <section id="conversation-subtitles" className="chat-panel" hidden={!showSubtitles} aria-label="對話字幕">
+        <header className="chat-header"><div className="chat-title">對話字幕<span>與哈妮</span></div><div className="chat-tools"><button className="icon-btn" disabled={sending||busy||connecting} onClick={newConversation} aria-label="開始新對話"><Icon name="plus"/></button><button className="icon-btn" onClick={()=>setShowSubtitles(false)} aria-label="關閉對話字幕"><Icon name="close"/></button></div></header>
+        <div className="chat-scroll" ref={scroll} role="log" aria-label="對話紀錄" aria-live={showSubtitles?'polite':'off'} aria-relevant="additions text">
+          {messages.length===0?<div className="empty-subtitles"><Icon name="chat"/><h3>每句話，都在這裡。</h3><p>開始通話後，你和哈妮說的話<br/>會即時顯示在這裡。</p><div className="suggestions">{prompts.map(p=><button key={p} disabled={sending} onClick={()=>send(p)}>{p}</button>)}</div></div>:messages.map(m=><article key={m.id} className={`message ${m.role} ${m.partial?'partial':''}`}><div className="message-label">{m.role==='user'?'你':'哈妮'}{m.partial&&<span>・{m.role==='user'?'辨識中':'回覆中'}</span>}</div><div className="bubble">{m.text}</div></article>)}
+          {busy&&<div className="thinking" role="status" aria-label="哈妮正在回覆"><i/><i/><i/></div>}
+        </div><div className="chat-bottom"><form className="inputbox" onSubmit={e=>{e.preventDefault();void send(text);}}><label htmlFor="message" className="sr-only">輸入文字訊息</label><input id="message" value={text} onChange={e=>setText(e.target.value)} maxLength={7900} placeholder="也可以打字給哈妮…" disabled={sending}/><button type="submit" aria-label="傳送訊息" disabled={!text.trim()||sending}><Icon name="send"/></button></form><p className="input-meta">語音與文字，共用同一段對話。</p></div>
+      </section>
+    </main><footer className="page-footer"><span>隨時，來講兩句。</span><small>語音及訊息由 Morari 處理 · AI 回覆可能有誤</small></footer><div ref={audio} className="replay-audio"/>
   </div>;
 }
