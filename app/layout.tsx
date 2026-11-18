@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "哈妮 Hani · 打一通客語電話",
-  description: "想講的話，打給哈妮。你的客語聊天夥伴，支援即時對話字幕。",
+  description: "想講客話，打分哈妮。你的客語聊天夥伴，支援即時對話字幕。",
   icons: {
     icon: "/favicon.svg",
     shortcut: "/favicon.svg",

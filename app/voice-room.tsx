@@ -332,7 +332,7 @@ export default function VoiceRoom() {
     <header className="topbar"><a className="wordmark" href="/" aria-label="國立聯合大學客家研究學院客家AI生態系首頁">國立聯合大學客家研究學院客家AI生態系</a><span className="header-note">一通電話，用客語聊聊。</span><span className="language"><span/>客語</span></header>
     <main className={`call-layout ${showSubtitles?'with-subtitles':''}`}>
       <section className="call-area" aria-label="與哈妮通話">
-        <div className="call-intro"><h1>想講的話，打給哈妮。</h1></div>
+        <div className="call-intro"><h1>想講客話，打分哈妮</h1></div>
         <div className={`contact-card ${callActive?'in-call':''}`}>
           <div className="contact-heading"><div><h2>哈妮</h2><span>Hani</span></div><span className={`availability ${callActive?'live':''}`}>{callActive?<><span/>{duration}</>:<>客語夥伴</>}</span></div>
           <div ref={orb} className={`orb-stage ${micActive||speaking||cueSpeaking?'is-active':''} ${connecting?'is-connecting':''}`}>
