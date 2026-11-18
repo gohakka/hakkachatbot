@@ -4,12 +4,15 @@ import { useEffect, useRef, useState } from 'react';
 import { events } from '../lib/sse.mjs';
 import { VoiceHealth } from '../lib/voice-health.mjs';
 import { playCallCue } from '../lib/call-cues.mjs';
+import { openPlatformConversation, platformMessageText, platformUserText, waitForPlatformRequest } from '../lib/platform-conversation.mjs';
 
 type Message = { id: string; role: 'user' | 'assistant'; text: string; partial?: boolean };
 type RoomType = import('livekit-client').Room;
 type Mode = 'idle' | 'connecting' | 'listening' | 'reconnecting';
 type HistoryItem = { id: string; role: string; content: { type: string; text?: string }[] };
 type ApiData = { error?: string; session_id: string; items?: HistoryItem[]; url: string; token: string };
+type SessionSummary = { session_id: string; title: string };
+type PendingRequest = { request_id: string; text: string; status: string };
 const prompts = ['陪我用客語聊聊', '教我一句生活客語', '介紹客家美食'];
 const notices: Record<string, string> = { translation_unavailable: '客語翻譯暫時無法使用，請稍候再試。', tts_hakka_unavailable: '客語語音暫時無法使用，請先看字幕。', stt_unavailable: '語音辨識暫時無法使用，請再說一次。', stt_warming: '語音辨識服務啟動中，請稍候再說。' };
 function Icon({ name, ...props }: { name: string; className?: string }) {
@@ -28,9 +31,9 @@ function Icon({ name, ...props }: { name: string; className?: string }) {
   };
   return <svg {...props} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name] ?? paths.chat}</svg>;
 }
-async function api(path: string, body?: unknown) {
+async function api<T = ApiData>(path: string, body?: unknown): Promise<T> {
   const r = await fetch(`/api/morari/${path}`, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
-  const d = await r.json() as ApiData; if (!r.ok) throw new Error(d.error || '無法連線至助理。'); return d;
+  const d = await r.json() as T & { error?: string }; if (!r.ok) throw new Error(d.error || '無法連線至助理。'); return d;
 }
 export default function VoiceRoom() {
   const [mode, setMode] = useState<Mode>('idle');
@@ -51,6 +54,9 @@ export default function VoiceRoom() {
   const [elapsed, setElapsed] = useState(0);
   const [cueSpeaking, setCueSpeaking] = useState(false);
   const [farewell, setFarewell] = useState(false);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [selectedSession, setSelectedSession] = useState('');
+  const [sessionLoading, setSessionLoading] = useState(true);
   const cueAudio = useRef<HTMLAudioElement>(null);
   const cueStop = useRef<() => void>(() => {});
   const helloPlayed = useRef(false);
@@ -90,6 +96,7 @@ export default function VoiceRoom() {
   useEffect(() => {
     mounted.current = true;
     void playCue('hello');
+    void ensureSession().catch(e=>{if(mounted.current)setError(e instanceof Error?e.message:'無法載入平台對話。');});
     return () => { mounted.current = false; cueStop.current();voiceWanted.current=false; generation.current++; if(voiceTimer.current) clearTimeout(voiceTimer.current); controllers.current.forEach(c => c.abort()); room.current?.disconnect(); meterCleanup.current(); context.current?.close(); };
   }, []);
   useEffect(() => {
@@ -121,21 +128,39 @@ export default function VoiceRoom() {
   function upsert(message: Message) {
     setMessages(old => { const i = old.findIndex(m => m.id === message.id); return i < 0 ? [...old, message] : old.map((m, j) => j === i ? message : m); });
   }
-  async function ensureSession() {
-    if (session.current) return session.current;
+  function rememberSession(id: string) {
+    const url=new URL(location.href);url.searchParams.set('session',id);history.replaceState(null,'',url);setSelectedSession(id);
+  }
+  async function ensureSession(forceNew = false, preferred?: string | null) {
+    if (session.current && !forceNew) return session.current;
     if (creating.current) return creating.current;
-    creating.current = api('session', { force_new: true }).then(d => { session.current = d.session_id; return d.session_id as string; });
-    try { return await creating.current; } finally { creating.current = null; }
+    const epoch=generation.current;setSessionLoading(true);
+    creating.current=(async()=>{
+      const fromURL=preferred===undefined?new URL(location.href).searchParams.get('session'):preferred;
+      const opened=await openPlatformConversation(api,fromURL,forceNew);
+      if(epoch!==generation.current||!mounted.current)throw new Error('對話已切換。');
+      const sid=opened.sessionId as string;
+      await syncHistory(sid,epoch);
+      const pending=await api<{requests:PendingRequest[]}>(`pending?session_id=${encodeURIComponent(sid)}`);
+      if(epoch!==generation.current||!mounted.current)throw new Error('對話已切換。');
+      session.current=sid;setSessions(opened.sessions);rememberSession(sid);
+      for(const request of pending.requests??[])if(['running','queued'].includes(request.status)){
+        setMessages(old=>old.some(m=>m.role==='user'&&m.text===request.text)?old:[...old,{id:`user-${request.request_id}`,role:'user',text:request.text}]);
+        void runTurn(request.request_id,sid);
+      }
+      return sid;
+    })();
+    try { return await creating.current; } finally { creating.current = null;if(mounted.current&&epoch===generation.current)setSessionLoading(false); }
   }
   async function syncHistory(sid: string, epoch: number) {
     const d = await api(`history?session_id=${encodeURIComponent(sid)}`);
     if (epoch !== generation.current || !mounted.current) return;
     const history: Message[] = (d.items ?? []).flatMap((m: { id: string; role: string; content: { type: string; text?: string }[] }) => {
-      const value = (m.content ?? []).filter(b => b.type === 'text').map(b => b.text ?? '').join('').replace(/^請用客語回答以下訊息：\n/, '');
+      const value = platformMessageText(m.content);
       return value ? [{ id: m.id, role: m.role === 'user' ? 'user' as const : 'assistant' as const, text: value }] : [];
     });
     // Replace optimistic turns only after every active stream has settled.
-    if (activeTurns.current.size === 0 && history.length) setMessages(history);
+    if (activeTurns.current.size === 0) setMessages(history);
   }
   async function consume(response: Response, requestId: string, sid: string, epoch: number) {
     let value = ''; let settled = false; const seen = new Set<string>();
@@ -172,22 +197,24 @@ export default function VoiceRoom() {
       const response = await fetch(initial === undefined ? `/api/morari/follow?session_id=${encodeURIComponent(sid)}&request_id=${encodeURIComponent(requestId)}` : '/api/morari/stream', {
         ...(initial !== undefined ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sid, request_id: requestId, text: initial }) } : {}), signal: controller.signal,
       });
-      const done = await consume(response, requestId, sid, epoch);
+      let done=false;
+      try {done=await consume(response,requestId,sid,epoch);} catch(e) {if(!response.ok)throw e;}
       if (!done && epoch === generation.current && !controller.signal.aborted) {
-        const follow = await fetch(`/api/morari/follow?session_id=${encodeURIComponent(sid)}&request_id=${encodeURIComponent(requestId)}`, { signal: controller.signal });
-        const finished = await consume(follow, requestId, sid, epoch);
-        if (!finished) throw new Error('回覆連線中斷，可在原平台查看完整紀錄。');
+        const result=await waitForPlatformRequest(()=>api<{status:string}>(`request?session_id=${encodeURIComponent(sid)}&request_id=${encodeURIComponent(requestId)}`),{signal:controller.signal});
+        if(!result)throw new Error('助理仍在處理，請稍後再查看。');
+        health.current.finish(requestId,result.status,Date.now());
+        if(result.status==='failed')setError('助理這次未能完成回覆，請再試一次。');
       }
     } catch(e) { if (!controller.signal.aborted && epoch === generation.current) setError(e instanceof Error ? e.message : '回覆連線中斷，請再試一次。'); }
     finally {
       controllers.current.delete(controller); following.current.delete(requestId); activeTurns.current.delete(requestId);
-      if (epoch === generation.current && mounted.current) { setBusy(activeTurns.current.size > 0); syncHistory(sid, epoch).catch(() => setError('字幕同步暫時中斷，已接收的字幕仍會保留。')); }
+      if (epoch === generation.current && mounted.current) { setBusy(activeTurns.current.size > 0); syncHistory(sid, epoch).catch(() => setError('字幕同步暫時中斷，已接收的字幕仍會保留。'));api<SessionSummary[]>('sessions').then(setSessions).catch(()=>{}); }
     }
   }
   async function send(value: string) {
-    if (!value.trim() || sending || changing.current) return;
+    if (!value.trim() || sending || changing.current || sessionLoading) return;
     setSending(true); setError('');
-    try { const sid = await ensureSession(); const id = crypto.randomUUID(); upsert({ id: `user-${id}`, role: 'user', text: value.trim() }); setText(''); await runTurn(id, sid, `請用客語回答以下訊息：\n${value.trim()}`); }
+    try { const sid = await ensureSession(); const id = crypto.randomUUID(); const originalText=platformUserText(value);upsert({ id: `user-${id}`, role: 'user', text: originalText }); setText(''); await runTurn(id, sid, originalText); }
     catch(e) { setError(e instanceof Error ? e.message : '傳送失敗，請再試一次。'); }
     finally { if(mounted.current) setSending(false); }
   }
@@ -316,13 +343,19 @@ export default function VoiceRoom() {
       try { await playCue('goodbye'); } finally {changing.current=false;}
     }
   }
-  async function newConversation() {
-    if(changing.current||sending||busy)return;
+  async function changeConversation(preferred: string | null) {
+    if(changing.current||sending||busy||sessionLoading)return;
     changing.current=true;generation.current++;if(voiceTimer.current)clearTimeout(voiceTimer.current);
     controllers.current.forEach(c=>c.abort());activeTurns.current.clear();following.current.clear();
-    const old=room.current;room.current=null;await old?.disconnect();meterCleanup.current();audio.current?.replaceChildren();
-    session.current=null;cueStop.current();setFarewell(false);helloPlayed.current=false;voiceWanted.current=false;health.current.reset();remoteTracks.current.clear();remoteEnergy.current.clear();setCallActive(false);setCallStartedAt(null);setElapsed(0);setCanRepair(false);setVoiceNotice('');setMessages([]);setError('');setMode('idle');setBusy(false);setSpeaking(false);setMicActive(false);blocked(false);changing.current=false;
+    const old=room.current;room.current=null;
+    try {
+      await old?.disconnect();meterCleanup.current();audio.current?.replaceChildren();
+      session.current=null;cueStop.current();setFarewell(false);helloPlayed.current=false;voiceWanted.current=false;health.current.reset();remoteTracks.current.clear();remoteEnergy.current.clear();setCallActive(false);setCallStartedAt(null);setElapsed(0);setCanRepair(false);setVoiceNotice('');setMessages([]);setError('');setMode('idle');setBusy(false);setSpeaking(false);setMicActive(false);blocked(false);
+      await ensureSession(preferred===null,preferred);
+    } catch(e) {if(mounted.current)setError(e instanceof Error?e.message:'無法切換對話。');}
+    finally {changing.current=false;}
   }
+  async function newConversation(){await changeConversation(null);}
   function toggleSound(){const next=!muted;setMuted(next);mutedRef.current=next;if(cueAudio.current)cueAudio.current.muted=next;audio.current?.querySelectorAll('audio').forEach(el=>{el.muted=next;});}
   async function unlockAudio(){await resumePlayback();}
   const connecting=mode==='connecting'||mode==='reconnecting';
@@ -342,17 +375,18 @@ export default function VoiceRoom() {
           <div className="contact-status" role="status">{status}</div><div ref={bars} className="wave-bars" aria-hidden="true">{Array.from({length:17},(_,i)=><i key={i}/>)}</div>
           {!callActive&&<p className="card-caption">說說今天，或只是打聲招呼。</p>}
         </div>
-        {!callActive?<button className="call-button" disabled={connecting||cueSpeaking} onClick={()=>toggleMic()}><Icon name="phone"/>{connecting?'正在連線…':cueSpeaking&&farewell?'道別中…':'開始通話'}</button>:<div className="call-controls"><button className={`control-button ${mode==='idle'?'selected':''}`} onClick={()=>toggleMic()} disabled={connecting} aria-pressed={mode==='idle'} aria-label={mode==='idle'?'開啟麥克風':'暫停麥克風'}><Icon name={mode==='idle'?'mute':'mic'}/><span>{mode==='idle'?'開啟麥克風':'麥克風'}</span></button><button className="hangup-button" onClick={endCall} disabled={connecting} aria-label="結束通話"><Icon name="hangup"/></button><button className={`control-button ${muted?'selected':''}`} onClick={toggleSound} aria-pressed={muted} aria-label={muted?'開啟哈妮的聲音':'靜音哈妮的聲音'}><Icon name={muted?'quiet':'sound'}/><span>{muted?'開啟聲音':'聲音'}</span></button></div>}
+        {!callActive?<button className="call-button" disabled={connecting||cueSpeaking||sessionLoading} onClick={()=>toggleMic()}><Icon name="phone"/>{sessionLoading?'載入對話…':connecting?'正在連線…':cueSpeaking&&farewell?'道別中…':'開始通話'}</button>:<div className="call-controls"><button className={`control-button ${mode==='idle'?'selected':''}`} onClick={()=>toggleMic()} disabled={connecting} aria-pressed={mode==='idle'} aria-label={mode==='idle'?'開啟麥克風':'暫停麥克風'}><Icon name={mode==='idle'?'mute':'mic'}/><span>{mode==='idle'?'開啟麥克風':'麥克風'}</span></button><button className="hangup-button" onClick={endCall} disabled={connecting} aria-label="結束通話"><Icon name="hangup"/></button><button className={`control-button ${muted?'selected':''}`} onClick={toggleSound} aria-pressed={muted} aria-label={muted?'開啟哈妮的聲音':'靜音哈妮的聲音'}><Icon name={muted?'quiet':'sound'}/><span>{muted?'開啟聲音':'聲音'}</span></button></div>}
         <button className={`subtitle-toggle ${showSubtitles?'enabled':''}`} role="switch" aria-checked={showSubtitles} aria-controls="conversation-subtitles" onClick={()=>setShowSubtitles(v=>!v)}><Icon name="chat"/><span>{showSubtitles?'關閉對話字幕':'開啟對話字幕'}</span><span className="switch-track"><span/></span></button>
         {canRepair&&<button className="repair-voice" disabled={connecting} onClick={()=>toggleMic(true)}>恢復語音</button>}
         <div className="call-notices">{voiceNotice&&<p className="voice-notice" role="status">{voiceNotice}</p>}{error&&<p className="error" role="alert">{error}</p>}{audioBlocked&&<button className="audio-unlock" onClick={()=>unlockAudio().catch(()=>setError('請檢查瀏覽器的聲音播放權限。'))}>點一下，開啟哈妮的聲音</button>}</div>
       </section>
       <section id="conversation-subtitles" className="chat-panel" hidden={!showSubtitles} aria-label="對話字幕">
-        <header className="chat-header"><div className="chat-title">對話字幕<span>與哈妮</span></div><div className="chat-tools"><button className="icon-btn" disabled={sending||busy||connecting} onClick={newConversation} aria-label="開始新對話"><Icon name="plus"/></button><button className="icon-btn" onClick={()=>setShowSubtitles(false)} aria-label="關閉對話字幕"><Icon name="close"/></button></div></header>
+        <header className="chat-header"><div className="chat-title">對話字幕<span>與哈妮</span></div><div className="chat-tools"><button className="icon-btn" disabled={sending||busy||connecting||sessionLoading} onClick={newConversation} aria-label="開始新對話"><Icon name="plus"/></button><button className="icon-btn" onClick={()=>setShowSubtitles(false)} aria-label="關閉對話字幕"><Icon name="close"/></button></div></header>
+        <div className="session-picker"><label htmlFor="conversation-session">延續對話</label><select id="conversation-session" aria-label="選擇平台對話" value={selectedSession} disabled={sessionLoading||sending||busy||connecting} onChange={e=>void changeConversation(e.target.value)}>{!selectedSession&&<option value="">{sessionLoading?'載入中…':'選擇對話'}</option>}{sessions.map(item=><option key={item.session_id} value={item.session_id}>{item.title||'新對話'}</option>)}</select></div>
         <div className="chat-scroll" ref={scroll} role="log" aria-label="對話紀錄" aria-live={showSubtitles?'polite':'off'} aria-relevant="additions text">
-          {messages.length===0?<div className="empty-subtitles"><Icon name="chat"/><h3>你好，食飽吂？</h3><p>開始通話後，字幕會即時顯示在這裡。</p><div className="suggestions">{prompts.map(p=><button key={p} disabled={sending} onClick={()=>send(p)}>{p}</button>)}</div></div>:messages.map(m=><article key={m.id} className={`message ${m.role} ${m.partial?'partial':''}`}><div className="message-label">{m.role==='user'?'你':'哈妮'}{m.partial&&<span>・{m.role==='user'?'辨識中':'回覆中'}</span>}</div><div className="bubble">{m.text}</div></article>)}
+          {messages.length===0?<div className="empty-subtitles"><Icon name="chat"/><h3>你好，食飽吂？</h3><p>開始通話後，字幕會即時顯示在這裡。</p><div className="suggestions">{prompts.map(p=><button key={p} disabled={sending||sessionLoading} onClick={()=>send(p)}>{p}</button>)}</div></div>:messages.map(m=><article key={m.id} className={`message ${m.role} ${m.partial?'partial':''}`}><div className="message-label">{m.role==='user'?'你':'哈妮'}{m.partial&&<span>・{m.role==='user'?'辨識中':'回覆中'}</span>}</div><div className="bubble">{m.text}</div></article>)}
           {busy&&<div className="thinking" role="status" aria-label="哈妮正在回覆"><i/><i/><i/></div>}
-        </div><div className="chat-bottom"><form className="inputbox" onSubmit={e=>{e.preventDefault();void send(text);}}><label htmlFor="message" className="sr-only">輸入文字訊息</label><input id="message" value={text} onChange={e=>setText(e.target.value)} maxLength={7900} placeholder="也可以打字給哈妮…" disabled={sending}/><button type="submit" aria-label="傳送訊息" disabled={!text.trim()||sending}><Icon name="send"/></button></form><p className="input-meta">語音與文字，共用同一段對話。</p></div>
+        </div><div className="chat-bottom"><form className="inputbox" onSubmit={e=>{e.preventDefault();void send(text);}}><label htmlFor="message" className="sr-only">輸入文字訊息</label><input id="message" value={text} onChange={e=>setText(e.target.value)} maxLength={7900} placeholder="也可以打字給哈妮…" disabled={sending||sessionLoading}/><button type="submit" aria-label="傳送訊息" disabled={!text.trim()||sending||sessionLoading}><Icon name="send"/></button></form><p className="input-meta">語音與文字，共用同一段對話。</p></div>
       </section>
     </main><footer className="page-footer"><span>隨時，來講兩句。</span><small>語音及訊息由 Morari 處理 · AI 回覆可能有誤</small></footer><div ref={audio} className="replay-audio"/><audio ref={cueAudio} preload="auto" src="/audio/hani-hello.wav" className="replay-audio"/>
   </div>;

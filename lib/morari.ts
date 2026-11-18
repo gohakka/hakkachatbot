@@ -29,7 +29,9 @@ export async function morari(request: Request, env: Env): Promise<Response> {
     const sid = body.session_id ?? u.searchParams.get('session_id');
     let path: string;
     let payload: unknown;
-    if (u.pathname === '/api/morari/session' && request.method === 'POST') {
+    if (u.pathname === '/api/morari/sessions' && request.method === 'GET') {
+      path = '/assistant/sessions';
+    } else if (u.pathname === '/api/morari/session' && request.method === 'POST') {
       if (sid != null && !validId(sid)) return reply({ error: '對話編號無效。' }, 400);
       path = '/assistant/sessions'; payload = { session_id: sid ?? null, force_new: body.force_new === true };
     } else {
@@ -39,6 +41,10 @@ export async function morari(request: Request, env: Env): Promise<Response> {
         path = '/assistant/voice/token'; payload = { session_id: sid, voice_language: 'hak' };
       } else if (u.pathname === '/api/morari/history' && request.method === 'GET') {
         path = `${root}/messages?limit=100`;
+      } else if (u.pathname === '/api/morari/pending' && request.method === 'GET') {
+        path = `${root}/pending`;
+      } else if (u.pathname === '/api/morari/request' && request.method === 'GET' && validId(u.searchParams.get('request_id'))) {
+        path = `${root}/requests/${encodeURIComponent(u.searchParams.get('request_id')!)}`;
       } else if (u.pathname === '/api/morari/stream' && request.method === 'POST') {
         if (!validId(body.request_id) || typeof body.text !== 'string' || !body.text.trim() || body.text.length > 8000) return reply({ error: '請輸入 1 至 8000 字的訊息。' }, 400);
         path = '/assistant/text/stream'; payload = { session_id: sid, request_id: body.request_id, text: body.text.trim() };

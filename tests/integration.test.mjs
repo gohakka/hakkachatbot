@@ -35,3 +35,15 @@ test('voice always requests Hakka; account tokens stay on server; expired login 
     assert.equal(response.headers.get('Cache-Control'),'no-store, no-transform');
   }finally{globalThis.fetch=original;}
 });
+
+test('session list, pending turns and request status use the same original-page endpoints', async()=>{
+  const original=globalThis.fetch;const paths=[];
+  globalThis.fetch=async(url)=>{paths.push(new URL(url).pathname);return Response.json(String(url).endsWith('/auth/login')?{access_token:'test-platform-token'}:{ok:true});};
+  try{
+    const env={MORARI_USERNAME:'platform-parity-test',MORARI_PASSWORD:'test-secret'};
+    for(const path of ['sessions','pending?session_id=original','request?session_id=original&request_id=turn']){
+      const response=await morari(new Request(`https://app.test/api/morari/${path}`),env);assert.equal(response.status,200);
+    }
+    assert.deepEqual(paths.filter(p=>!p.endsWith('/auth/login')),['/api/v1/assistant/sessions','/api/v1/assistant/sessions/original/pending','/api/v1/assistant/sessions/original/requests/turn']);
+  }finally{globalThis.fetch=original;}
+});
