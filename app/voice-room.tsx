@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { events } from '../lib/sse.mjs';
+import { VoiceHealth } from '../lib/voice-health.mjs';
 
 type Message = { id: string; role: 'user' | 'assistant'; text: string; partial?: boolean };
 type RoomType = import('livekit-client').Room;
@@ -38,6 +39,8 @@ export default function VoiceRoom() {
   const [muted, setMuted] = useState(false);
   const [audioBlocked, setAudioBlocked] = useState(false);
   const [micActive, setMicActive] = useState(false);
+  const [voiceNotice, setVoiceNotice] = useState('');
+  const [canRepair, setCanRepair] = useState(false);
   const room = useRef<RoomType | null>(null);
   const session = useRef<string | null>(null);
   const creating = useRef<Promise<string> | null>(null);
@@ -48,6 +51,15 @@ export default function VoiceRoom() {
   const bars = useRef<HTMLDivElement>(null);
   const audio = useRef<HTMLDivElement>(null);
   const mutedRef = useRef(false);
+  const blockedRef = useRef(false);
+  const voiceWanted = useRef(false);
+  const health = useRef(new VoiceHealth());
+  const restoreVoice = useRef<() => void>(() => {});
+  const modeRef = useRef<Mode>('idle');
+  modeRef.current = mode;
+  const remoteTracks = useRef(new Set<string>());
+  const remoteEnergy = useRef(new Map<string, number>());
+  const healthBusy = useRef(false);
   const meterCleanup = useRef<() => void>(() => {});
   const context = useRef<AudioContext | null>(null);
   const analysers = useRef<Map<string, AnalyserNode>>(new Map());
@@ -59,8 +71,33 @@ export default function VoiceRoom() {
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; generation.current++; if(voiceTimer.current) clearTimeout(voiceTimer.current); controllers.current.forEach(c => c.abort()); room.current?.disconnect(); meterCleanup.current(); context.current?.close(); };
+    return () => { mounted.current = false; voiceWanted.current=false; generation.current++; if(voiceTimer.current) clearTimeout(voiceTimer.current); controllers.current.forEach(c => c.abort()); room.current?.disconnect(); meterCleanup.current(); context.current?.close(); };
   }, []);
+  useEffect(() => {
+    const timer=setInterval(async()=>{
+      if(healthBusy.current || !room.current || !voiceWanted.current || changing.current || document.visibilityState!=='visible')return;
+      healthBusy.current=true;
+      const currentRoom=room.current;
+      try {
+        // RTP energy still works when requestAnimationFrame is throttled.
+        for(const participant of currentRoom.remoteParticipants.values()) for(const publication of participant.audioTrackPublications.values()) {
+          const track=publication.track;
+          if(!track)continue;
+          const stats=await (track as import('livekit-client').RemoteAudioTrack).getReceiverStats();
+          if(room.current!==currentRoom)return;
+          const energy=stats?.totalAudioEnergy;
+          if(typeof energy==='number') {
+            const before=remoteEnergy.current.get(track.mediaStreamTrack.id);
+            if(before!==undefined && energy-before>0.00001)health.current.heard(Date.now());
+            remoteEnergy.current.set(track.mediaStreamTrack.id,energy);
+          }
+        }
+        if(health.current.shouldRecover(Date.now(),{listening:modeRef.current==='listening',muted:mutedRef.current,blocked:blockedRef.current,visible:true}))restoreVoice.current();
+      } catch { /* A receiver can disappear while a track is being replaced. */ }
+      finally {healthBusy.current=false;}
+    },2000);
+    return ()=>clearInterval(timer);
+  },[]);
   useEffect(() => { if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [messages, busy]);
   function upsert(message: Message) {
     setMessages(old => { const i = old.findIndex(m => m.id === message.id); return i < 0 ? [...old, message] : old.map((m, j) => j === i ? message : m); });
@@ -91,12 +128,15 @@ export default function VoiceRoom() {
         if (e.id && seen.has(e.id)) continue;
         if (e.id) seen.add(e.id);
         if (e.type === 'TEXT_BLOCK_DELTA') {
+          health.current.text(requestId,Date.now());
           value += e.delta ?? e.text ?? '';
           upsert({ id: `reply-${requestId}`, role: 'assistant', text: value, partial: true });
         } else if (e.type === 'REPLY_NOTICE') setError(notices[e.kind] || '助理服務暫時無法使用。');
       }
       if (frame.name === 'final' || frame.name === 'accepted') {
         if (['completed', 'cancelled', 'interrupted', 'failed'].includes(d.status)) {
+          if(typeof d.reply==='string'&&d.reply.trim())health.current.text(requestId,Date.now());
+          health.current.finish(requestId,d.status,Date.now());
           settled = true;
           if (d.status === 'failed') setError('助理這次未能完成回覆，請再試一次。');
         }
@@ -144,7 +184,7 @@ export default function VoiceRoom() {
     const sample = new Uint8Array(256);
     const tick = (time: number) => {
       let level = 0;
-      for(const analyser of analysers.current.values()) { analyser.getByteTimeDomainData(sample); let sum = 0; for(const v of sample) sum += ((v-128)/128)**2; level = Math.max(level, Math.min(1, Math.sqrt(sum/sample.length)*6)); }
+      for(const [id,analyser] of analysers.current) { analyser.getByteTimeDomainData(sample); let sum = 0; for(const v of sample) sum += ((v-128)/128)**2; const rms=Math.sqrt(sum/sample.length); level = Math.max(level, Math.min(1, rms*6)); if(remoteTracks.current.has(id)&&rms>.003)health.current.heard(Date.now()); }
       smooth = smooth*.65 + level*.35;
       orb.current?.style.setProperty('--level', String(smooth));
       if (bars.current) Array.from(bars.current.children).forEach((bar,i) => (bar as HTMLElement).style.height = `${4 + smooth * (10+18*Math.abs(Math.sin(i*.9+time/260)))}px`);
@@ -153,21 +193,42 @@ export default function VoiceRoom() {
     }; frame=requestAnimationFrame(tick);
     meterCleanup.current=()=>{cancelAnimationFrame(frame);sources.current.forEach(s=>s.disconnect());sources.current.clear();analysers.current.clear();orb.current?.style.setProperty('--level','0');bars.current?.querySelectorAll('i').forEach(b=>b.style.height='4px');};
   }
-  async function toggleMic() {
+  function blocked(value: boolean) { blockedRef.current=value;setAudioBlocked(value); }
+  async function resumePlayback() {
+    await context.current?.resume();
+    const r=room.current;
+    if(!r)return;
+    await r.startAudio();
+    const elements=audio.current?.querySelectorAll('audio')??[];
+    await Promise.all(Array.from(elements,el=>{el.muted=mutedRef.current;return el.play();}));
+    blocked(!r.canPlaybackAudio);
+  }
+  async function toggleMic(repair = false) {
     if (changing.current) return;
     changing.current=true; setError('');
+    const wanted=repair?voiceWanted.current:true;
     try {
+      // Run before waiting for imports/network, while the user gesture is active.
+      context.current ??= new AudioContext(); await context.current.resume();
+      if(repair) {
+        setMode('reconnecting');setVoiceNotice('正在恢復語音，對話字幕會保留…');
+        health.current.attempted(Date.now());
+        if(voiceTimer.current)clearTimeout(voiceTimer.current);
+        const old=room.current;room.current=null;
+        await old?.disconnect();meterCleanup.current();audio.current?.replaceChildren();
+        remoteTracks.current.clear();remoteEnergy.current.clear();setSpeaking(false);
+      }
       const sdk=await import('livekit-client');
       if(room.current && room.current.state === sdk.ConnectionState.Connected) {
         const on=!room.current.localParticipant.isMicrophoneEnabled;
-        await room.current.localParticipant.setMicrophoneEnabled(on); setMode(on?'listening':'idle');
+        await room.current.localParticipant.setMicrophoneEnabled(on); voiceWanted.current=on;setMode(on?'listening':'idle');
+        if(!on)health.current.turn=null;
+        await resumePlayback().catch(()=>blocked(true));
         if(on) { const track=room.current.localParticipant.getTrackPublication(sdk.Track.Source.Microphone)?.track?.mediaStreamTrack; if(track) attachMeter(track); }
         return;
       }
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('此瀏覽器無法使用麥克風，請使用 HTTPS 或本機 localhost 開啟。');
-      setMode('connecting');
-      // Resume AudioContext during the user's gesture; browser owns microphone permission.
-      context.current ??= new AudioContext(); await context.current.resume();
+      setMode(repair?'reconnecting':'connecting');
       const sid=await ensureSession();
       const d=await api('voice',{session_id:sid});
       const r=new sdk.Room({adaptiveStream:true,dynacast:true,audioCaptureDefaults:{echoCancellation:true,noiseSuppression:false,autoGainControl:true}});
@@ -175,53 +236,57 @@ export default function VoiceRoom() {
       const epoch=generation.current;
       const current=()=>epoch===generation.current && room.current===r && mounted.current;
       const agentReady=()=>{if(voiceTimer.current)clearTimeout(voiceTimer.current);voiceTimer.current=null;};
-      r.on(sdk.RoomEvent.TrackSubscribed,track=>{if(!current()||track.kind!==sdk.Track.Kind.Audio)return;const element=track.attach();element.autoplay=true;element.muted=mutedRef.current;audio.current?.appendChild(element);element.play().catch(()=>setAudioBlocked(true));attachMeter(track.mediaStreamTrack);});
-      r.on(sdk.RoomEvent.TrackUnsubscribed,track=>{track.detach().forEach(el=>el.remove());const id=track.mediaStreamTrack.id;analysers.current.delete(id);sources.current.get(id)?.disconnect();sources.current.delete(id);});
+      r.on(sdk.RoomEvent.TrackSubscribed,track=>{if(!current()||track.kind!==sdk.Track.Kind.Audio)return;const element=track.attach();element.autoplay=true;element.muted=mutedRef.current;audio.current?.appendChild(element);element.play().catch(()=>{if(current())blocked(true);});remoteTracks.current.add(track.mediaStreamTrack.id);attachMeter(track.mediaStreamTrack);});
+      r.on(sdk.RoomEvent.TrackUnsubscribed,track=>{track.detach().forEach(el=>el.remove());const id=track.mediaStreamTrack.id;remoteTracks.current.delete(id);remoteEnergy.current.delete(id);analysers.current.delete(id);sources.current.get(id)?.disconnect();sources.current.delete(id);});
+      r.on(sdk.RoomEvent.AudioPlaybackStatusChanged,()=>{if(current())blocked(!r.canPlaybackAudio);});
       r.on(sdk.RoomEvent.TranscriptionReceived,(segments,participant)=>{if(!current()||!participant?.isLocal)return;for(const segment of segments)if(segment.text)upsert({id:'local-draft',role:'user',text:segment.text,partial:!segment.final});});
       r.on(sdk.RoomEvent.ActiveSpeakersChanged,participants=>{if(current())setSpeaking(participants.some(p=>!p.isLocal));});
       r.on(sdk.RoomEvent.ParticipantConnected,p=>{if(p.isAgent)agentReady();});
+      r.on(sdk.RoomEvent.ParticipantDisconnected,p=>{if(!current()||!p.isAgent||!voiceWanted.current)return;setVoiceNotice('助理語音已離線，正在重新連線…');if(voiceTimer.current)clearTimeout(voiceTimer.current);voiceTimer.current=setTimeout(()=>{if(current()&&voiceWanted.current)restoreVoice.current();},1500);});
       r.on(sdk.RoomEvent.Reconnecting,()=>{if(current())setMode('reconnecting');});
-      r.on(sdk.RoomEvent.Reconnected,()=>{if(current())setMode(r.localParticipant.isMicrophoneEnabled?'listening':'idle');});
-      r.on(sdk.RoomEvent.Disconnected,()=>{if(!current())return;agentReady();room.current=null;setMode('idle');setSpeaking(false);setMicActive(false);meterCleanup.current();audio.current?.replaceChildren();setError('語音連線已結束，按麥克風即可重新連線。');});
+      r.on(sdk.RoomEvent.Reconnected,()=>{if(current()){setMode(r.localParticipant.isMicrophoneEnabled?'listening':'idle');void resumePlayback().catch(()=>blocked(true));}});
+      r.on(sdk.RoomEvent.Disconnected,()=>{if(!current())return;agentReady();room.current=null;setMode('idle');setSpeaking(false);setMicActive(false);meterCleanup.current();audio.current?.replaceChildren();setVoiceNotice('語音連線已結束，可按「恢復語音」重新連線。');});
       r.registerTextStreamHandler('morari.voice.events',async reader=>{
         const raw=await reader.readAll();if(!current())return;
         try {const e=JSON.parse(raw);if(e.session_id!==sid)return;
           if(e.type==='voice_error'){setError(notices[e.kind]||'這次語音未能辨識，請再說一次。');return;}
-          if(e.type==='final_transcript'&&e.request_id&&e.text){setMessages(old=>old.filter(m=>m.id!=='local-draft'));upsert({id:`user-${e.request_id}`,role:'user',text:e.text});void runTurn(e.request_id,sid);}
+          if(e.type==='final_transcript'&&e.request_id&&e.text){health.current.begin(e.request_id);setMessages(old=>old.filter(m=>m.id!=='local-draft'));upsert({id:`user-${e.request_id}`,role:'user',text:e.text});void resumePlayback().catch(()=>blocked(true));void runTurn(e.request_id,sid);}
         } catch {setError('無法讀取語音字幕，請再試一次。');}
       });
       await r.connect(d.url,d.token);if(!current()){await r.disconnect();return;}
-      await r.startAudio().catch(()=>setAudioBlocked(true));
-      await r.localParticipant.setMicrophoneEnabled(true);
+      await resumePlayback().catch(()=>blocked(true));
+      await r.localParticipant.setMicrophoneEnabled(wanted);
+      voiceWanted.current=wanted;
       const track=r.localParticipant.getTrackPublication(sdk.Track.Source.Microphone)?.track?.mediaStreamTrack;
       startMeter();
       if(track)attachMeter(track);
       r.remoteParticipants.forEach(p=>p.audioTrackPublications.forEach(pub=>{if(pub.track)attachMeter(pub.track.mediaStreamTrack);}));
-      setMode('listening');
+      setMode(wanted?'listening':'idle');setCanRepair(true);setVoiceNotice(repair?'語音已重新連線，請再說一句話試試。':'');
       if(![...r.remoteParticipants.values()].some(p=>p.isAgent))voiceTimer.current=setTimeout(()=>{if(current())setError('助理仍在準備中；若持續沒有回應，請暫停後重新開啟麥克風。');},20000);
     } catch(e) {
       const r=room.current;room.current=null;await r?.disconnect();meterCleanup.current();audio.current?.replaceChildren();setMode('idle');setSpeaking(false);
       setError(e instanceof Error && e.name==='NotAllowedError'?'麥克風權限尚未開啟，請在瀏覽器允許麥克風後重試。':e instanceof Error?e.message:'語音連線失敗，請再試一次。');
     } finally {changing.current=false;}
   }
+  restoreVoice.current=()=>{if(!changing.current&&health.current.canAttempt(Date.now()))void toggleMic(true);};
   async function newConversation() {
     if(changing.current||sending||busy)return;
     changing.current=true;generation.current++;if(voiceTimer.current)clearTimeout(voiceTimer.current);
     controllers.current.forEach(c=>c.abort());activeTurns.current.clear();following.current.clear();
     const old=room.current;room.current=null;await old?.disconnect();meterCleanup.current();audio.current?.replaceChildren();
-    session.current=null;setMessages([]);setError('');setMode('idle');setBusy(false);setSpeaking(false);setMicActive(false);setAudioBlocked(false);changing.current=false;
+    session.current=null;voiceWanted.current=false;health.current.reset();remoteTracks.current.clear();remoteEnergy.current.clear();setCanRepair(false);setVoiceNotice('');setMessages([]);setError('');setMode('idle');setBusy(false);setSpeaking(false);setMicActive(false);blocked(false);changing.current=false;
   }
   function toggleSound(){const next=!muted;setMuted(next);mutedRef.current=next;audio.current?.querySelectorAll('audio').forEach(el=>{el.muted=next;});}
-  async function unlockAudio(){await room.current?.startAudio();await context.current?.resume();setAudioBlocked(false);}
+  async function unlockAudio(){await resumePlayback();}
   const status=mode==='connecting'?'正在連接客語助理…':mode==='reconnecting'?'正在重新連線…':speaking?'助理說話中':mode==='listening'?(micActive?'聽著你講…':'麥克風已開啟，請開始說話'):busy?'助理正在思考…':'準備好了，來聊聊天';
   return <div className="app">
     <header className="topbar"><a className="brand" href="/" aria-label="客語共下講首頁"><span className="brandmark">客</span><div><div className="brandname">共下講</div><small>HAKKA VOICE COMPANION</small></div></a><div className="navmeta"><span className="language">客語對話</span><span>讓熟悉的語言，陪你聊聊日常</span></div></header>
     <main className="layout"><section className="voice-side" aria-label="語音對話控制"><div className="eyebrow">A LITTLE CONVERSATION, IN HAKKA</div><h1>用客語，<br/><span>講你想講的。</span></h1><p className="intro">一聲問候、一段日常，都可以從這裡開始。<br/>按下麥克風，讓我們陪你慢慢聊。</p>
-      <div ref={orb} className={`orb-stage ${micActive||speaking?'is-active':''}`} aria-hidden={false}><span className="orbit"/><span className="orbit"/><span className="orbit"/><span className="orb-glow"/><span className="ripple"/><span className="ripple delay"/><span className="orbit-dot"/><button className={`mic ${mode==='listening'?'on':''}`} onClick={toggleMic} disabled={mode==='connecting'||mode==='reconnecting'} aria-pressed={mode==='listening'} aria-label={mode==='listening'?'暫停麥克風':'開啟麥克風，開始客語對話'}><Icon name={mode==='listening'?'mute':'mic'}/><span>{mode==='connecting'?'連線中':mode==='listening'?'點一下暫停':'點一下開始'}</span></button></div>
-      <div className="voice-status" role="status"><span className={`status-light ${mode==='listening'||speaking?'active':''}`}/>{status}</div><div ref={bars} className="wave-bars" aria-hidden="true">{Array.from({length:23},(_,i)=><i key={i}/>)}</div><p className="hint">{mode==='listening'?'說完稍停，助理就會回應你':'開啟後可持續對話，再按一次即可暫停'}</p><div className="voice-footer"><span><Icon name="mic"/>預設客語</span><span><Icon name="chat"/>即時對話字幕</span><span><Icon name="shield"/>由 Morari 助理提供服務</span></div>
+      <div ref={orb} className={`orb-stage ${micActive||speaking?'is-active':''}`} aria-hidden={false}><span className="orbit"/><span className="orbit"/><span className="orbit"/><span className="orb-glow"/><span className="ripple"/><span className="ripple delay"/><span className="orbit-dot"/><button className={`mic ${mode==='listening'?'on':''}`} onClick={()=>toggleMic()} disabled={mode==='connecting'||mode==='reconnecting'} aria-pressed={mode==='listening'} aria-label={mode==='listening'?'暫停麥克風':'開啟麥克風，開始客語對話'}><Icon name={mode==='listening'?'mute':'mic'}/><span>{mode==='connecting'?'連線中':mode==='listening'?'點一下暫停':'點一下開始'}</span></button></div>
+      <div className="voice-status" role="status"><span className={`status-light ${mode==='listening'||speaking?'active':''}`}/>{status}</div><div ref={bars} className="wave-bars" aria-hidden="true">{Array.from({length:23},(_,i)=><i key={i}/>)}</div>{canRepair&&<button className="repair-voice" disabled={mode==='connecting'||mode==='reconnecting'} onClick={()=>toggleMic(true)}>恢復語音</button>}<p className="hint">{mode==='listening'?'說完稍停，助理就會回應你':'開啟後可持續對話，再按一次即可暫停'}</p><div className="voice-footer"><span><Icon name="mic"/>預設客語</span><span><Icon name="chat"/>即時對話字幕</span><span><Icon name="shield"/>由 Morari 助理提供服務</span></div>
     </section><section className="chat-panel" aria-label="對話字幕"><header className="chat-header"><div className="chat-title"><Icon name="chat"/>對話字幕<small>即時</small></div><div style={{display:'flex',gap:8}}><button className="icon-btn" onClick={toggleSound} aria-label={muted?'開啟助理聲音':'靜音助理聲音'} aria-pressed={muted}><Icon name={muted?'quiet':'sound'}/></button><button className="icon-btn" disabled={sending||busy||mode==='connecting'||mode==='reconnecting'} onClick={newConversation}><Icon name="plus"/>新對話</button></div></header>
       <div className="chat-scroll" ref={scroll} role="log" aria-label="對話紀錄" aria-live="polite" aria-relevant="additions text"><div className="date-rule">從一句問候開始</div>{messages.length===0?<div className="message"><div className="message-label"><span className="mini-avatar">客</span>客語助理</div><div className="bubble"><div className="welcome-emblem" aria-hidden="true">✳</div><p className="welcome-title">你好，歡迎來到共下講。</p><p className="welcome-copy">想練習客語，還是找個伴聊聊？<br/>按下左邊的麥克風，說說今天的心情。<br/>你說的話和助理的回覆，都會出現在這裡。</p></div><div className="suggestions">{prompts.map(p=><button key={p} disabled={sending} onClick={()=>send(p)}>{p}</button>)}</div></div>:messages.map(m=><article key={m.id} className={`message ${m.role} ${m.partial?'partial':''}`}><div className="message-label">{m.role==='assistant'&&<span className="mini-avatar">客</span>}{m.role==='user'?'你':'客語助理'}{m.partial&&<span>・{m.role==='user'?'辨識中':'回覆中'}</span>}</div><div className="bubble">{m.text}</div></article>)}{busy&&<div className="thinking" role="status" aria-label="助理正在回覆"><i/><i/><i/></div>}</div>
-      {error&&<div className="error" role="alert">{error}</div>}{audioBlocked&&<button className="audio-unlock" onClick={()=>unlockAudio().catch(()=>setError('請檢查瀏覽器的聲音播放權限。'))}>點一下，開啟助理聲音</button>}<div className="chat-bottom"><form className="inputbox" onSubmit={e=>{e.preventDefault();void send(text);}}><label htmlFor="message" className="sr-only">輸入文字訊息</label><input id="message" value={text} onChange={e=>setText(e.target.value)} maxLength={7900} placeholder="也可以打字，和助理聊聊…" disabled={sending}/><button type="submit" aria-label="傳送訊息" disabled={!text.trim()||sending}><Icon name="send"/></button></form><p className="input-meta">語音與文字皆連接同一段對話 · 預設客語回覆</p></div>
+      {voiceNotice&&<div className="voice-notice" role="status">{voiceNotice}</div>}{error&&<div className="error" role="alert">{error}</div>}{audioBlocked&&<button className="audio-unlock" onClick={()=>unlockAudio().catch(()=>setError('請檢查瀏覽器的聲音播放權限。'))}>點一下，開啟助理聲音</button>}<div className="chat-bottom"><form className="inputbox" onSubmit={e=>{e.preventDefault();void send(text);}}><label htmlFor="message" className="sr-only">輸入文字訊息</label><input id="message" value={text} onChange={e=>setText(e.target.value)} maxLength={7900} placeholder="也可以打字，和助理聊聊…" disabled={sending}/><button type="submit" aria-label="傳送訊息" disabled={!text.trim()||sending}><Icon name="send"/></button></form><p className="input-meta">語音與文字皆連接同一段對話 · 預設客語回覆</p></div>
     </section></main><p className="bottom-note">語音及訊息由 Morari 平台處理 · AI 回覆可能有誤，請依實際情況確認</p><div ref={audio} className="replay-audio"/>
   </div>;
 }
