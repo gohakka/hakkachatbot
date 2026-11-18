@@ -1,5 +1,6 @@
 // Server-only adapter. Account credentials and access tokens stay on the server.
-type Env = { MORARI_USERNAME?: string; MORARI_PASSWORD?: string };
+import { isPlatformOwner, guestSession, sessionCookie, type SessionAccessEnv } from './session-access.ts';
+type Env = SessionAccessEnv & { MORARI_USERNAME?: string };
 const BASE = 'https://3c.ouob.net/api/v1';
 let cached: { token: string; expires: number; username: string } | null = null;
 let loggingIn: Promise<string> | null = null;
@@ -25,17 +26,23 @@ export async function morari(request: Request, env: Env): Promise<Response> {
   const origin = request.headers.get('Origin');
   if (origin && origin !== u.origin) return reply({ error: '不允許此來源。' }, 403);
   try {
+    const owner = isPlatformOwner(request, env);
+    if (u.pathname === '/api/morari/viewer' && request.method === 'GET') return reply({ can_resume_platform: owner });
+    const guest = owner ? null : await guestSession(request, env);
     const body = request.method === 'POST' ? await request.json() as Record<string, unknown> : {};
     const sid = body.session_id ?? u.searchParams.get('session_id');
     let path: string;
     let payload: unknown;
     if (u.pathname === '/api/morari/sessions' && request.method === 'GET') {
+      if (!owner) return reply(guest ? [{ session_id: guest, title: '這段對話' }] : []);
       path = '/assistant/sessions';
     } else if (u.pathname === '/api/morari/session' && request.method === 'POST') {
       if (sid != null && !validId(sid)) return reply({ error: '對話編號無效。' }, 400);
-      path = '/assistant/sessions'; payload = { session_id: sid ?? null, force_new: body.force_new === true };
+      if (!owner && sid != null && sid !== guest) return reply({ error: '請先登入原帳號，才能延續這段平台對話。' }, 403);
+      path = '/assistant/sessions'; payload = owner ? { session_id: sid ?? null, force_new: body.force_new === true } : { session_id: body.force_new === true ? null : guest, force_new: body.force_new === true || !guest };
     } else {
       if (!validId(sid)) return reply({ error: '請先建立對話。' }, 400);
+      if (!owner && sid !== guest) return reply({ error: '請先登入原帳號，才能讀取這段平台對話。' }, 403);
       const root = `/assistant/sessions/${encodeURIComponent(sid)}`;
       if (u.pathname === '/api/morari/voice' && request.method === 'POST') {
         path = '/assistant/voice/token'; payload = { session_id: sid, voice_language: 'hak' };
@@ -61,6 +68,10 @@ export async function morari(request: Request, env: Env): Promise<Response> {
     let response = await upstream();
     if (response.status === 401) { await response.body?.cancel(); response = await upstream(true); }
     if (!response.ok) { await response.body?.cancel(); return reply({ error: response.status === 429 ? '目前使用較頻繁，請稍候再試。' : '助理平台暫時無法完成請求，請稍後重試。' }, response.status >= 500 ? 502 : response.status); }
+    if (!owner && u.pathname === '/api/morari/session') {
+      const opened = await response.json() as { session_id: string };
+      return Response.json(opened, { headers: { 'Cache-Control': 'no-store', 'Set-Cookie': await sessionCookie(opened.session_id, env) } });
+    }
     return new Response(response.body, { headers: { 'Content-Type': response.headers.get('Content-Type') || 'application/json', 'Cache-Control': 'no-store, no-transform', 'X-Accel-Buffering': 'no' } });
   } catch (e) {
     return reply({ error: e instanceof SyntaxError ? '請求格式有誤。' : e instanceof Error && e.message.includes('尚未設定') ? e.message : '連線逾時或平台暫時無法使用，請再試一次。' }, 502);

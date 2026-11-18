@@ -57,6 +57,8 @@ export default function VoiceRoom() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedSession, setSelectedSession] = useState('');
   const [sessionLoading, setSessionLoading] = useState(true);
+  const [canResumePlatform, setCanResumePlatform] = useState(false);
+  const [signInPath, setSignInPath] = useState('/signin-with-chatgpt?return_to=%2F');
   const cueAudio = useRef<HTMLAudioElement>(null);
   const cueStop = useRef<() => void>(() => {});
   const helloPlayed = useRef(false);
@@ -95,6 +97,7 @@ export default function VoiceRoom() {
   },[callActive,callStartedAt]);
   useEffect(() => {
     mounted.current = true;
+    setSignInPath('/signin-with-chatgpt?return_to='+encodeURIComponent(location.pathname+location.search));
     void playCue('hello');
     void ensureSession().catch(e=>{if(mounted.current)setError(e instanceof Error?e.message:'無法載入平台對話。');});
     return () => { mounted.current = false; cueStop.current();voiceWanted.current=false; generation.current++; if(voiceTimer.current) clearTimeout(voiceTimer.current); controllers.current.forEach(c => c.abort()); room.current?.disconnect(); meterCleanup.current(); context.current?.close(); };
@@ -137,6 +140,9 @@ export default function VoiceRoom() {
     const epoch=generation.current;setSessionLoading(true);
     creating.current=(async()=>{
       const fromURL=preferred===undefined?new URL(location.href).searchParams.get('session'):preferred;
+      const viewer=await api<{can_resume_platform:boolean}>('viewer');
+      if(epoch!==generation.current||!mounted.current)throw new Error('對話已切換。');
+      setCanResumePlatform(viewer.can_resume_platform);
       const opened=await openPlatformConversation(api,fromURL,forceNew);
       if(epoch!==generation.current||!mounted.current)throw new Error('對話已切換。');
       const sid=opened.sessionId as string;
@@ -378,11 +384,11 @@ export default function VoiceRoom() {
         {!callActive?<button className="call-button" disabled={connecting||cueSpeaking||sessionLoading} onClick={()=>toggleMic()}><Icon name="phone"/>{sessionLoading?'載入對話…':connecting?'正在連線…':cueSpeaking&&farewell?'道別中…':'開始通話'}</button>:<div className="call-controls"><button className={`control-button ${mode==='idle'?'selected':''}`} onClick={()=>toggleMic()} disabled={connecting} aria-pressed={mode==='idle'} aria-label={mode==='idle'?'開啟麥克風':'暫停麥克風'}><Icon name={mode==='idle'?'mute':'mic'}/><span>{mode==='idle'?'開啟麥克風':'麥克風'}</span></button><button className="hangup-button" onClick={endCall} disabled={connecting} aria-label="結束通話"><Icon name="hangup"/></button><button className={`control-button ${muted?'selected':''}`} onClick={toggleSound} aria-pressed={muted} aria-label={muted?'開啟哈妮的聲音':'靜音哈妮的聲音'}><Icon name={muted?'quiet':'sound'}/><span>{muted?'開啟聲音':'聲音'}</span></button></div>}
         <button className={`subtitle-toggle ${showSubtitles?'enabled':''}`} role="switch" aria-checked={showSubtitles} aria-controls="conversation-subtitles" onClick={()=>setShowSubtitles(v=>!v)}><Icon name="chat"/><span>{showSubtitles?'關閉對話字幕':'開啟對話字幕'}</span><span className="switch-track"><span/></span></button>
         {canRepair&&<button className="repair-voice" disabled={connecting} onClick={()=>toggleMic(true)}>恢復語音</button>}
-        <div className="call-notices">{voiceNotice&&<p className="voice-notice" role="status">{voiceNotice}</p>}{error&&<p className="error" role="alert">{error}</p>}{audioBlocked&&<button className="audio-unlock" onClick={()=>unlockAudio().catch(()=>setError('請檢查瀏覽器的聲音播放權限。'))}>點一下，開啟哈妮的聲音</button>}</div>
+        <div className="call-notices">{voiceNotice&&<p className="voice-notice" role="status">{voiceNotice}</p>}{error&&<p className="error" role="alert">{error}</p>}{!canResumePlatform&&error.includes('登入')&&<a className="audio-unlock history-signin" href={signInPath} target="_top">登入並延續原平台對話</a>}{audioBlocked&&<button className="audio-unlock" onClick={()=>unlockAudio().catch(()=>setError('請檢查瀏覽器的聲音播放權限。'))}>點一下，開啟哈妮的聲音</button>}</div>
       </section>
       <section id="conversation-subtitles" className="chat-panel" hidden={!showSubtitles} aria-label="對話字幕">
         <header className="chat-header"><div className="chat-title">對話字幕<span>與哈妮</span></div><div className="chat-tools"><button className="icon-btn" disabled={sending||busy||connecting||sessionLoading} onClick={newConversation} aria-label="開始新對話"><Icon name="plus"/></button><button className="icon-btn" onClick={()=>setShowSubtitles(false)} aria-label="關閉對話字幕"><Icon name="close"/></button></div></header>
-        <div className="session-picker"><label htmlFor="conversation-session">延續對話</label><select id="conversation-session" aria-label="選擇平台對話" value={selectedSession} disabled={sessionLoading||sending||busy||connecting} onChange={e=>void changeConversation(e.target.value)}>{!selectedSession&&<option value="">{sessionLoading?'載入中…':'選擇對話'}</option>}{sessions.map(item=><option key={item.session_id} value={item.session_id}>{item.title||'新對話'}</option>)}</select></div>
+        <div className="session-picker"><label htmlFor="conversation-session">延續對話</label><select id="conversation-session" aria-label="選擇平台對話" value={selectedSession} disabled={sessionLoading||sending||busy||connecting} onChange={e=>void changeConversation(e.target.value)}>{!selectedSession&&<option value="">{sessionLoading?'載入中…':'選擇對話'}</option>}{sessions.map(item=><option key={item.session_id} value={item.session_id}>{item.title||'新對話'}</option>)}</select>{!canResumePlatform&&<a className="history-signin" href={signInPath} target="_top">登入延續原平台對話</a>}</div>
         <div className="chat-scroll" ref={scroll} role="log" aria-label="對話紀錄" aria-live={showSubtitles?'polite':'off'} aria-relevant="additions text">
           {messages.length===0?<div className="empty-subtitles"><Icon name="chat"/><h3>你好，食飽吂？</h3><p>開始通話後，字幕會即時顯示在這裡。</p><div className="suggestions">{prompts.map(p=><button key={p} disabled={sending||sessionLoading} onClick={()=>send(p)}>{p}</button>)}</div></div>:messages.map(m=><article key={m.id} className={`message ${m.role} ${m.partial?'partial':''}`}><div className="message-label">{m.role==='user'?'你':'哈妮'}{m.partial&&<span>・{m.role==='user'?'辨識中':'回覆中'}</span>}</div><div className="bubble">{m.text}</div></article>)}
           {busy&&<div className="thinking" role="status" aria-label="哈妮正在回覆"><i/><i/><i/></div>}
